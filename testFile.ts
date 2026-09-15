@@ -1,5 +1,5 @@
 import { performance } from "perf_hooks";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { createChatModel, isOllama } from "./llm";
 import {
   Annotation,
   MessagesAnnotation,
@@ -21,10 +21,11 @@ import {
   BedrockAgentCoreClient,
   Role,
 } from "@aws-sdk/client-bedrock-agentcore";
-import { fetchWorkOrderTool } from "./tools/fetchWorkOrderTool";
+import { findWorkOrdersTool } from "./tools/findWorkOrdersTool";
+import { createWorkOrderTool } from "./tools/createWorkOrderTool";
 import { queryKnowledgeBaseTool } from "./tools/queryKnowledgeBaseTool";
 import * as crypto from "crypto";
-import { SYSTEM_INSTRUCTION } from "./constants/prompts";
+import { buildSystemInstruction } from "./constants/prompts";
 import { webSearchGroundingTool } from "./tools/webSearchTool";
 
 // ---------------------------
@@ -36,6 +37,29 @@ const logStep = (label: string, start: number) => {
   return duration;
 };
 
+/** Per-token chunk logging. Noisy by design — off unless explicitly asked for. */
+const DEBUG_TOKENS = process.env.DEBUG_AGENT_TOKENS === "1";
+
+/**
+ * Gemini and Ollama both stream `content` as a string OR as an array of parts,
+ * so anything that reads it for logging has to flatten it rather than cast.
+ */
+const textOf = (content: unknown): string => {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return (content as any[])
+      .map((part) =>
+        typeof part === "string"
+          ? part
+          : part && typeof part.text === "string"
+            ? part.text
+            : ""
+      )
+      .join("");
+  }
+  return "";
+};
+
 // --- Graph Setup ---
 const StateAnnotation = Annotation.Root({
   ...MessagesAnnotation.spec,
@@ -43,15 +67,28 @@ const StateAnnotation = Annotation.Root({
 });
 
 // --- Singletons ---
-const tools = [fetchWorkOrderTool, queryKnowledgeBaseTool, webSearchGroundingTool];
+const tools = [
+  findWorkOrdersTool,
+  createWorkOrderTool,
+  queryKnowledgeBaseTool,
+  // webSearchGroundingTool calls the Gemini API directly (grounding), so it is
+  // still rate-limited even when the chat model runs on Ollama. Drop it while
+  // testing locally.
+  ...(isOllama ? [] : [webSearchGroundingTool]),
+];
 const toolNode = new ToolNode(tools);
 
-const model = new ChatGoogleGenerativeAI({
-  model: "gemini-2.5-flash",
-  apiKey: process.env.GEMINI_API_KEY,
+// gemini-2.5-flash returns EMPTY CANDIDATES (finishReason STOP, 0 output tokens,
+// no text and no function call) for this system prompt + tool set — reproducibly,
+// and for ordinary queries, not just edge cases. Trimming the prompt flips the
+// behaviour unpredictably, so it is not one offending phrase to remove. 3-flash
+// answers every one of the same prompts correctly, and is what index.ts already
+// uses. 
+const model = createChatModel({
+  model: "gemini-3-flash-preview",
   streaming: true,
   temperature: 0.3,
-}).bindTools(tools);
+}).bindTools!(tools);
 
 // ---------------------------
 // Model Call With Timing
@@ -64,7 +101,9 @@ const callModel = async (
   console.log("🚀 Agent model streaming started");
 
   const stream = await model.stream(
-    [new SystemMessage(SYSTEM_INSTRUCTION), ...state.messages],
+    // Built per call, not once at import: the prompt carries today's date and
+    // this process stays up for days.
+    [new SystemMessage(buildSystemInstruction(new Date())), ...state.messages],
     config
   );
 
@@ -73,8 +112,8 @@ const callModel = async (
 
   for await (const chunk of stream) {
     const rawContent = (chunk as any).content;
-    console.log('rawContent- ', rawContent);
-    
+    if (DEBUG_TOKENS) console.log("rawContent- ", rawContent);
+
     let textDelta = "";
 
     // Extract ONLY human-readable text, ignore function/tool call payloads
@@ -159,6 +198,7 @@ export async function runWorkOrderAgent(
     actor_id,
     session_id,
     organizationId,
+    actionToken,
     onToken,
   }: {
     memoryClient: BedrockAgentCoreClient;
@@ -166,6 +206,8 @@ export async function runWorkOrderAgent(
     actor_id: string;
     session_id: string;
     organizationId: string;
+    /** Short-lived credential minted by web-back; the work order tool presents it. */
+    actionToken?: string;
     onToken?: (token: string) => void;
   }
 ) {
@@ -234,44 +276,107 @@ export async function runWorkOrderAgent(
   };
 
   const stream = await app.stream(initialState, {
-    configurable: { thread_id, onToken: onToken },
+    configurable: { thread_id, onToken: onToken, actionToken },
     metadata: { onToken },
     streamMode: "messages",
   });
 
   let finalContent = "";
   let lastToolCall: any = null;
+  /**
+   * Every character the agent node emitted, never reset.
+   *
+   * `finalContent` is wiped whenever a chunk carries a tool call, so that
+   * "let me look that up…" does not get persisted as the answer. But the user
+   * has ALREADY SEEN that text — `onToken` streams all agent text over SSE as it
+   * is produced — and if the run ends on a tool-call chunk the wipe leaves
+   * nothing at all. That is how an empty assistant entry reached Bedrock, which
+   * rejects the whole event and took the user's own message down with it.
+   */
+  let streamedText = "";
+
+  // `streamMode: "messages"` yields one tuple per TOKEN CHUNK, not per node —
+  // so a node name on a tuple says which node produced that token, nothing more.
+  // Logging inside the loop therefore printed one "node executed" line per token
+  // and timed the loop body (microseconds) instead of the node. Track the
+  // transitions instead: the log below emits one line per real node entry, and
+  // the elapsed time it reports is the node's actual wall-clock cost.
+  let currentNode: string | undefined;
+  let nodeStart = performance.now();
+  let nodeTokens = 0;
+  let step = 0;
+
+  const closeNode = () => {
+    if (!currentNode) return;
+    const ms = performance.now() - nodeStart;
+    console.log(
+      `⬅️ Node ${currentNode} finished in ${ms.toFixed(2)} ms (${nodeTokens} chunk${nodeTokens === 1 ? "" : "s"})`
+    );
+  };
 
   for await (const [message, metadata] of stream) {
-    const nodeStart = performance.now();
+    const node: string | undefined = metadata?.langgraph_node;
 
-    if (metadata?.langgraph_node) {
-      console.log(`➡️ Node executed: ${metadata.langgraph_node}`);
+    if (node && node !== currentNode) {
+      closeNode();
+      step += 1;
+      console.log(`➡️ [step ${step}] Node entered: ${node}`);
+      currentNode = node;
+      nodeStart = performance.now();
+      nodeTokens = 0;
     }
+    nodeTokens += 1;
 
-    if (metadata.langgraph_node === "agent") {
-      const content = message.content as string;
-
-      // if (content && onToken) {
-      //   onToken(content);
-      // }
-
-      finalContent += content;
+    if (node === "agent") {
+      const delta = textOf(message.content);
+      finalContent += delta;
+      streamedText += delta;
 
       if ((message as AIMessage).tool_calls?.length) {
         lastToolCall = (message as AIMessage).tool_calls;
-        console.log(
-          `🛠️ Tool requested: ${lastToolCall
-            .map((t: any) => t.name)
-            .join(", ")}`
-        );
+        for (const call of lastToolCall) {
+          console.log(
+            `🛠️ Tool requested: ${call.name} ${JSON.stringify(call.args)}`
+          );
+        }
+        finalContent = "";
       }
     }
 
-    logStep(`⏳ Node ${metadata?.langgraph_node}`, nodeStart);
+    if (node === "tools") {
+      // The tool's own return value. Nothing used to log it, which is why a
+      // PREVIEW, a NEEDS CLARIFICATION and an outright failure were
+      // indistinguishable in the logs after the fact.
+      const result = textOf(message.content);
+      console.log(
+        `🧰 Tool result: ${(message as any).name} → ${result.slice(0, 600)}${result.length > 600 ? " …[truncated]" : ""}`
+      );
+    }
   }
+  closeNode();
 
   logStep("🌊 Total streaming", streamStart);
+  console.log(`🧭 Graph path: ${step} node execution${step === 1 ? "" : "s"}`);
+
+  /**
+   * A turn that produced NO text and NO tool call is a dead end, and nothing
+   * throws on the way there: the request succeeds, SSE closes, and the user is
+   * left looking at an empty bubble. Gemini does exactly this — a candidate with
+   * finishReason STOP and zero output tokens — and this emptiness is the only
+   * signal it happened. Say something rather than nothing.
+   *
+   * Streamed to the user but deliberately NOT persisted: a canned apology in the
+   * history teaches the model nothing and would be read back as a real answer.
+   */
+  let fallbackText = "";
+  if (streamedText.trim().length === 0 && !lastToolCall) {
+    fallbackText =
+      "I wasn't able to put together an answer for that. Could you rephrase it and try again?";
+    console.warn(
+      "⚠️ Empty model turn (no text, no tool call) — streaming a fallback reply"
+    );
+    onToken?.(fallbackText);
+  }
 
   // ---------------------------
   // 4. Persistence
@@ -279,38 +384,61 @@ export async function runWorkOrderAgent(
   const persistStart = performance.now();
   console.log("💾 Persistence started");
 
-  await memoryClient.send(
-    new CreateEventCommand({
-      memoryId,
-      actorId: actor_id,
-      sessionId: session_id,
-      eventTimestamp: new Date(),
-      clientToken: crypto.randomUUID(),
-      payload: [
-        { conversational: { role: Role.USER, content: { text: userQuery } } },
-        ...(lastToolCall
-          ? [
-              {
-                conversational: {
-                  role: Role.TOOL,
-                  content: {
-                    text: `Used Tools: ${lastToolCall
-                      .map((t: any) => t.name)
-                      .join(", ")}`,
-                  },
-                },
-              },
-            ]
-          : []),
-        {
-          conversational: {
-            role: Role.ASSISTANT,
-            content: { text: finalContent },
+  // Bedrock rejects any payload entry whose text is empty — and it rejects the
+  // WHOLE event, so one blank assistant reply used to lose the user's message
+  // too and fail a request whose answer had already been streamed to them.
+  // Build the entries, then drop the blanks.
+  // Prefer the post-tool answer; fall back to everything the user was shown.
+  const assistantText = finalContent.trim().length > 0 ? finalContent : streamedText;
+
+  const memoryPayload = [
+    { role: Role.USER, text: userQuery },
+    ...(lastToolCall
+      ? [
+          {
+            role: Role.TOOL,
+            text: `Used Tools: ${lastToolCall.map((t: any) => t.name).join(", ")}`,
           },
-        },
-      ],
-    })
-  );
+        ]
+      : []),
+    { role: Role.ASSISTANT, text: assistantText },
+  ]
+    .filter((entry) => typeof entry.text === "string" && entry.text.trim().length > 0)
+    .map((entry) => ({
+      conversational: { role: entry.role, content: { text: entry.text } },
+    }));
+
+  if (finalContent.trim().length === 0 && assistantText.trim().length > 0) {
+    console.warn(
+      "⚠️ Run ended on a tool call; persisting the text the user was actually shown"
+    );
+  } else if (assistantText.trim().length === 0) {
+    // The turn produced no text at all. Persist it without an assistant entry
+    // rather than losing the user's message to a rejected event.
+    console.warn(
+      "⚠️ No assistant text for this turn; persisting the turn without an assistant entry"
+    );
+  }
+
+  if (memoryPayload.length > 0) {
+    try {
+      await memoryClient.send(
+        new CreateEventCommand({
+          memoryId,
+          actorId: actor_id,
+          sessionId: session_id,
+          eventTimestamp: new Date(),
+          clientToken: crypto.randomUUID(),
+          payload: memoryPayload,
+        })
+      );
+    } catch (err) {
+      // The user already has the full answer over SSE. Losing the memory write
+      // costs continuity on the next turn; failing the request here would throw
+      // away a reply they have already read.
+      console.error("💾 Persistence failed; continuing without it:", err);
+    }
+  }
 
   logStep("💾 Persistence", persistStart);
 
@@ -326,5 +454,5 @@ export async function runWorkOrderAgent(
   console.log(`🏆 TOTAL TIME: ${totalDuration.toFixed(2)} ms`);
   console.log("=================================================");
 
-  return finalContent;
+  return assistantText.trim().length > 0 ? assistantText : fallbackText;
 }

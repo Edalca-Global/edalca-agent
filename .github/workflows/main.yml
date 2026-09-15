@@ -74,5 +74,6 @@ jobs:
                 "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}",
                 "GENERAL_KB_ID": "${{ secrets.GENERAL_KB_ID }}",
                 "KB_ID": "${{ secrets.KB_ID }}",
-                "MONGO_URI": "${{ secrets.MONGO_URI }}"
+                "MONGO_URI": "${{ secrets.MONGO_URI }}",
+                "WEB_BACK_URL": "${{ secrets.WEB_BACK_URL }}"
             }'

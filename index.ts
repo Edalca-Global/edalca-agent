@@ -18,7 +18,7 @@ import { ListEventsCommand } from "@aws-sdk/client-bedrock-agentcore";
 import { cleanPastMessagesAfterReset, extractSourcesFromMessages } from "./utils";
 import { queryKnowledgeBaseTool } from "./tools/queryKnowledgeBaseTool";
 import { SYSTEM_PROMPT } from "./constants/prompts";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { createChatModel } from "./llm";
 
 function convertEventToMessages(event: any): BaseMessage[] {
   console.log('event', event);
@@ -150,11 +150,10 @@ const toolNode = new ToolNode<typeof GraphState.State>(tools);
 // ---------------------------
 // 1. Initialize the model
 // Use the official LangChain class - it handles Zod schemas automatically
-const model = new ChatGoogleGenerativeAI({
+const model = createChatModel({
   model: 'gemini-3-flash-preview', // or "gemini-1.5-flash"
-  apiKey: process.env.GEMINI_API_KEY,
   temperature: 0,
-}).bindTools(tools); 
+}).bindTools!(tools);
 
 // 2. Updated callModel node
 async function callModel(state: typeof GraphState.State) {

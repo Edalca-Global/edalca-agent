@@ -1,12 +1,11 @@
+import "dotenv/config";
 import express, { Request, Response } from "express";
 import { callAgent } from "./index";
-import dotenv from "dotenv";
 import cors from "cors";
 import { BedrockAgentCoreControlClient } from "@aws-sdk/client-bedrock-agentcore-control";
 import { BedrockAgentCoreClient } from "@aws-sdk/client-bedrock-agentcore";
 import { runWorkOrderAgent } from "./testFile";
 
-dotenv.config();
 const app = express();
 const port = process.env.PORT || 8080;
 // Middleware
@@ -30,6 +29,27 @@ const memoryClient = new BedrockAgentCoreClient({
 });
 
 // Handle invocation requests from the Bedrock AgentCore Runtime with streaming
+/**
+ * `actionToken` is a live bearer credential for the Action Layer, and this body
+ * was being logged verbatim on every invocation — into CloudWatch, whose read
+ * audience is far wider than the API the token guards. The length is kept
+ * because it is the only diagnostic the log ever carried: it separates "no token
+ * was sent" from "a token was sent and rejected".
+ */
+const redactBody = (body: unknown): unknown => {
+  if (!body || typeof body !== "object") return body;
+  const { actionToken, ...rest } = body as Record<string, unknown>;
+  return {
+    ...rest,
+    actionToken:
+      typeof actionToken === "string"
+        ? `[redacted len=${actionToken.length}]`
+        : actionToken === undefined
+        ? "[absent]"
+        : "[redacted]",
+  };
+};
+
 app.post("/invocations", async (req: Request, res: Response) => {
   const startTime = Date.now();
   console.log('Agent Invoked ', startTime);
@@ -47,9 +67,12 @@ app.post("/invocations", async (req: Request, res: Response) => {
     logStep("[1/6] Server: Request received");
     // await initializeMongoConnection();
     // logStep("[2/6] Server: MongoDB connection initialized");
-    console.log("-Request Body", req.body);
+    console.log("-Request Body", redactBody(req.body));
 
-    const { prompt: userQuery, chatId, memoryId, sessionId, userId, organizationId } = req.body;
+    // `chatId` is intentionally not forwarded to the agent: web-back binds it
+    // into the action token at mint time, so the work order draft is scoped to
+    // this conversation without the model ever handling an identifier.
+    const { prompt: userQuery, chatId, memoryId, sessionId, userId, organizationId, actionToken } = req.body;
 
     if (!userQuery || typeof userQuery !== "string") {
       return res
@@ -108,6 +131,7 @@ app.post("/invocations", async (req: Request, res: Response) => {
       actor_id: userId,
       session_id: sessionId,
       organizationId,
+      actionToken,
       onToken,
     });
 
