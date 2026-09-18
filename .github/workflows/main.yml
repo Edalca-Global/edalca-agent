@@ -1,4 +1,4 @@
-name: Deploy to ECR
+name: Deploy to ECR and Update Bedrock Agent
 
 on:
   push:
@@ -7,8 +7,11 @@ on:
       - production
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
+    # This line tells GitHub which set of environment secrets to use
+    environment: ${{ github.ref_name }}
+    
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -30,13 +33,17 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Determine Image Tag
+      - name: Set Environment Variables
         id: vars
         run: |
           if [[ "${{ github.ref_name }}" == "production" ]]; then
             echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "runtime_id=edalca_agent_prod-Fs8i278B72" >> $GITHUB_OUTPUT
+            echo "role_arn=arn:aws:iam::724772076413:role/service-role/AmazonBedrockAgentCoreRuntimeDefaultServiceRole-ue9l6" >> $GITHUB_OUTPUT
           else
             echo "tag=dev-latest" >> $GITHUB_OUTPUT
+            echo "runtime_id=edalca_agent-Zw5Q4q6PFw" >> $GITHUB_OUTPUT
+            echo "role_arn=arn:aws:iam::724772076413:role/service-role/AmazonBedrockAgentCoreRuntimeDefaultServiceRole-ym7jc" >> $GITHUB_OUTPUT
           fi
 
       - name: Build and Push ARM64 Image
@@ -45,8 +52,27 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           tags: |
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/edalca-agent:${{ steps.vars.outputs.tag }}
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/edalca-agent:${{ github.sha }}
+
+      - name: Update Bedrock AgentCore Runtime
+        run: |
+          aws bedrock-agentcore-control update-agent-runtime \
+            --agent-runtime-id "${{ steps.vars.outputs.runtime_id }}" \
+            --role-arn "${{ steps.vars.outputs.role_arn }}" \
+            --network-configuration '{"networkMode": "PUBLIC"}' \
+            --agent-runtime-artifact '{"containerConfiguration": {"containerUri": "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/edalca-agent:${{ steps.vars.outputs.tag }}"}}' \
+            --lifecycle-configuration '{
+                "idleRuntimeSessionTimeout": 28800, 
+                "maxLifetime": 28800
+            }' \
+            --environment-variables '{
+                "AWS_ACCESS_KEY_ID": "${{ secrets.AWS_ACCESS_KEY_ID }}",
+                "AWS_REGION":  "${{ secrets.AWS_REGION }}",
+                "AWS_SECRET_ACCESS_KEY": "${{ secrets.AWS_SECRET_ACCESS_KEY }}",
+                "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}",
+                "GENERAL_KB_ID": "${{ secrets.GENERAL_KB_ID }}",
+                "KB_ID": "${{ secrets.KB_ID }}",
+                "MONGO_URI": "${{ secrets.MONGO_URI }}"
+            }'
