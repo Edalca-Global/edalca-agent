@@ -72,7 +72,7 @@ app.post("/invocations", async (req: Request, res: Response) => {
     // `chatId` is intentionally not forwarded to the agent: web-back binds it
     // into the action token at mint time, so the work order draft is scoped to
     // this conversation without the model ever handling an identifier.
-    const { prompt: userQuery, chatId, memoryId, sessionId, userId, organizationId, actionToken } = req.body;
+    const { prompt: userQuery, chatId, memoryId, sessionId, userId, organizationId, actionToken, channel } = req.body;
 
     if (!userQuery || typeof userQuery !== "string") {
       return res
@@ -132,6 +132,9 @@ app.post("/invocations", async (req: Request, res: Response) => {
       session_id: sessionId,
       organizationId,
       actionToken,
+      // Only "whatsapp" narrows the tool set; anything else — including absent,
+      // which is what every existing caller sends — is the normal chat surface.
+      channel: channel === "whatsapp" ? "whatsapp" : "chat",
       onToken,
     });
 

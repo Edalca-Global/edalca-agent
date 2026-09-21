@@ -37,7 +37,18 @@ export const SYSTEM_PROMPT = `Role: You are a high-precision data retrieval and 
  * per model call also keeps it correct across midnight and across a container
  * that stays up for days, which a module-level call would not.
  */
-export function buildSystemInstruction(now: Date = new Date()): string {
+/**
+ * Which surface the user is on. WhatsApp is READ-ONLY (see `SURFACE_TOOLS` in
+ * testFile.ts), so the prompt must be told as well as the tool binder — a model
+ * that still believes it can create a work order will promise one and then have
+ * no tool to do it with, which reads to the user as the agent lying.
+ */
+export type AgentChannel = "chat" | "whatsapp";
+
+export function buildSystemInstruction(
+  now: Date = new Date(),
+  channel: AgentChannel = "chat",
+): string {
   // Interim: the user's real timezone is not sent in the invocation payload, so
   // someone in America/New_York saying "today" late in the evening still gets
   // tomorrow's UTC date. The durable fix is web-back passing an IANA zone.
@@ -50,14 +61,35 @@ export function buildSystemInstruction(now: Date = new Date()): string {
   }).format(now);
   const weekday = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "long" }).format(now);
 
+  const isWhatsapp = channel === "whatsapp";
+
+  // Kept in sync by hand with the tool arrays in testFile.ts. If a tool is
+  // unbound for a channel it must not be advertised here.
+  const roleTools = isWhatsapp
+    ? "You have access to 3 tools: find_work_orders, query_documents_kb and deep_web_research (use this for realtime data access)."
+    : "You have access to 4 tools: find_work_orders, create_work_order, query_documents_kb and deep_web_research (use this for realtime data access).";
+
+  const channelNote = isWhatsapp
+    ? `
+# CHANNEL: WHATSAPP
+You are replying over WhatsApp, not the EDALCA app. This changes two things:
+- **You cannot create or change anything.** create_work_order is NOT available on this channel.
+  If the user asks to create, raise, open, update or close a work order, say plainly that this is
+  not available over WhatsApp and ask them to do it in the EDALCA app. Never promise to create one,
+  never collect the details "ready for later", and ignore section 2 below entirely.
+- **Keep replies short.** There is no rich formatting and no scrolling pane. Prefer a few short
+  lines over headings and tables, and lead with the answer.
+`
+    : "";
+
   return `
 # CONTEXT
 - Today is ${weekday}, ${today} (${timeZone}). Use this for every relative date the user gives —
   "today", "tomorrow", "next Friday", "end of the month" — and whenever a tool needs today's date.
   Never ask the user what today's date is, and never guess the year.
-
+${channelNote}
 # ROLE
-You are Lynk Agent. You bridge the gap between natural language and the company's systems. You have access to 4 tools: find_work_orders, create_work_order, query_documents_kb and deep_web_research (use this for realtime data access).
+You are Lynk Agent. You bridge the gap between natural language and the company's systems. ${roleTools}
 
 # TOOL RULES
 

@@ -25,7 +25,7 @@ import { findWorkOrdersTool } from "./tools/findWorkOrdersTool";
 import { createWorkOrderTool } from "./tools/createWorkOrderTool";
 import { queryKnowledgeBaseTool } from "./tools/queryKnowledgeBaseTool";
 import * as crypto from "crypto";
-import { buildSystemInstruction } from "./constants/prompts";
+import { buildSystemInstruction, AgentChannel } from "./constants/prompts";
 import { webSearchGroundingTool } from "./tools/webSearchTool";
 
 // ---------------------------
@@ -67,16 +67,34 @@ const StateAnnotation = Annotation.Root({
 });
 
 // --- Singletons ---
-const tools = [
+
+// webSearchGroundingTool calls the Gemini API directly (grounding), so it is
+// still rate-limited even when the chat model runs on Ollama. Drop it while
+// testing locally.
+const READ_TOOLS = [
   findWorkOrdersTool,
-  createWorkOrderTool,
   queryKnowledgeBaseTool,
-  // webSearchGroundingTool calls the Gemini API directly (grounding), so it is
-  // still rate-limited even when the chat model runs on Ollama. Drop it while
-  // testing locally.
   ...(isOllama ? [] : [webSearchGroundingTool]),
 ];
-const toolNode = new ToolNode(tools);
+
+/**
+ * The tool set each surface gets.
+ *
+ * WhatsApp is READ-ONLY: `create_work_order` is not bound there, because the
+ * tool's confirmation step is a free-text "yes" and a channel where messages
+ * arrive out of order, duplicated, or hours late is not one to take a database
+ * write from. The capability is withheld per channel rather than deleted so
+ * re-enabling it later is a one-line change here, not a revert.
+ *
+ * `buildSystemInstruction` is told the same thing — see the CHANNEL block in
+ * prompts.ts. Both must be updated together.
+ */
+type AgentTool = (typeof READ_TOOLS)[number] | typeof createWorkOrderTool;
+
+const SURFACE_TOOLS: Record<AgentChannel, AgentTool[]> = {
+  chat: [...READ_TOOLS, createWorkOrderTool],
+  whatsapp: READ_TOOLS,
+};
 
 // gemini-2.5-flash returns EMPTY CANDIDATES (finishReason STOP, 0 output tokens,
 // no text and no function call) for this system prompt + tool set — reproducibly,
@@ -84,26 +102,26 @@ const toolNode = new ToolNode(tools);
 // behaviour unpredictably, so it is not one offending phrase to remove. 3-flash
 // answers every one of the same prompts correctly, and is what index.ts already
 // uses. 
-const model = createChatModel({
-  model: "gemini-3-flash-preview",
-  streaming: true,
-  temperature: 0.3,
-}).bindTools!(tools);
+const buildModel = (tools: AgentTool[]) =>
+  createChatModel({
+    model: "gemini-3-flash-preview",
+    streaming: true,
+    temperature: 0.3,
+  }).bindTools!(tools);
 
 // ---------------------------
 // Model Call With Timing
 // ---------------------------
-const callModel = async (
-  state: typeof StateAnnotation.State,
-  config?: any
-) => {
+const makeCallModel =
+  (model: ReturnType<typeof buildModel>, channel: AgentChannel) =>
+  async (state: typeof StateAnnotation.State, config?: any) => {
   const start = performance.now();
   console.log("🚀 Agent model streaming started");
 
   const stream = await model.stream(
     // Built per call, not once at import: the prompt carries today's date and
     // this process stays up for days.
-    [new SystemMessage(buildSystemInstruction(new Date())), ...state.messages],
+    [new SystemMessage(buildSystemInstruction(new Date(), channel)), ...state.messages],
     config
   );
 
@@ -172,17 +190,32 @@ const callModel = async (
 // ---------------------------
 const compileStart = performance.now();
 
-const workflow = new StateGraph(StateAnnotation)
-  .addNode("agent", callModel)
-  .addNode("tools", toolNode)
-  .addEdge(START, "agent")
-  .addConditionalEdges("agent", (state) => {
-    const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
-    return lastMsg.tool_calls?.length ? "tools" : END;
-  })
-  .addEdge("tools", "agent");
+/**
+ * One compiled graph per channel.
+ *
+ * The tool set is baked into both the bound model and the ToolNode, so it
+ * cannot be swapped per request on a single graph — a channel that shares a
+ * graph shares its tools. Compiling twice at module load costs nothing and
+ * makes it impossible for a WhatsApp turn to reach a write tool by accident.
+ */
+const buildChannelGraph = (channel: AgentChannel) => {
+  const tools = SURFACE_TOOLS[channel];
+  return new StateGraph(StateAnnotation)
+    .addNode("agent", makeCallModel(buildModel(tools), channel))
+    .addNode("tools", new ToolNode(tools))
+    .addEdge(START, "agent")
+    .addConditionalEdges("agent", (state) => {
+      const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
+      return lastMsg.tool_calls?.length ? "tools" : END;
+    })
+    .addEdge("tools", "agent")
+    .compile();
+};
 
-const app = workflow.compile();
+const GRAPHS: Record<AgentChannel, ReturnType<typeof buildChannelGraph>> = {
+  chat: buildChannelGraph("chat"),
+  whatsapp: buildChannelGraph("whatsapp"),
+};
 
 logStep("📦 Graph compilation", compileStart);
 
@@ -199,6 +232,7 @@ export async function runWorkOrderAgent(
     session_id,
     organizationId,
     actionToken,
+    channel = "chat",
     onToken,
   }: {
     memoryClient: BedrockAgentCoreClient;
@@ -208,6 +242,12 @@ export async function runWorkOrderAgent(
     organizationId: string;
     /** Short-lived credential minted by web-back; the work order tool presents it. */
     actionToken?: string;
+    /**
+     * Which surface the turn came from. Selects the tool set — "whatsapp" is
+     * read-only. Defaults to "chat" so an older caller that sends no channel
+     * behaves exactly as before.
+     */
+    channel?: AgentChannel;
     onToken?: (token: string) => void;
   }
 ) {
@@ -275,7 +315,12 @@ export async function runWorkOrderAgent(
     summaries: summaryContext,
   };
 
-  const stream = await app.stream(initialState, {
+  // An unrecognised channel falls back to the read-only set rather than the
+  // permissive one: the payload is forwarded from an HTTP body, so an unknown
+  // value means "we do not know where this came from", not "trust it".
+  const graph = GRAPHS[channel] ?? GRAPHS.whatsapp;
+
+  const stream = await graph.stream(initialState, {
     configurable: { thread_id, onToken: onToken, actionToken },
     metadata: { onToken },
     streamMode: "messages",
