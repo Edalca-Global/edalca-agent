@@ -44,11 +44,7 @@ jobs:
           elif [[ "${{ github.ref_name }}" == "qa-testing" ]]; then
             echo "tag=qa-latest" >> $GITHUB_OUTPUT
             echo "runtime_id=edalca_agent_qa-jSfSuH86dJ" >> $GITHUB_OUTPUT
-            # TODO: the QA runtime's IAM service role ARN, still to be filled in.
-            # While this is empty the update step below skips itself, so pushes
-            # to qa-testing build and publish edalca-agent:qa-latest but do not
-            # roll the runtime over to it.
-            echo "role_arn=" >> $GITHUB_OUTPUT
+            echo "role_arn=arn:aws:iam::724772076413:role/service-role/AmazonBedrockAgentCoreRuntimeDefaultServiceRole-h9iqv" >> $GITHUB_OUTPUT
           else
             echo "tag=dev-latest" >> $GITHUB_OUTPUT
             echo "runtime_id=edalca_agent-Zw5Q4q6PFw" >> $GITHUB_OUTPUT
