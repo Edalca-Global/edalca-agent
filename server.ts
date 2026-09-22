@@ -116,6 +116,16 @@ app.post("/invocations", async (req: Request, res: Response) => {
       })}\n\n`);
     };
 
+    // A later agent pass supersedes everything streamed so far this turn.
+    // Consumers must DISCARD, not append — see `callModel` in testFile.ts.
+    const onReset = () => {
+      accumulatedTokens = "";
+      res.write(`data: ${JSON.stringify({
+        type: 'reset',
+        timestamp: new Date().toISOString(),
+      })}\n\n`);
+    };
+
     // const agentResponse = await callAgent(userQuery, `thread-${Date.now()}`, {
     //   memoryClient,
     //   memoryId,
@@ -123,6 +133,7 @@ app.post("/invocations", async (req: Request, res: Response) => {
     //   session_id: sessionId,
     //   organizationId,
     //   onToken,
+    //   onReset,
     // });
 
     const agentResponse = await runWorkOrderAgent(userQuery, `thread-${Date.now()}`, {
@@ -133,6 +144,7 @@ app.post("/invocations", async (req: Request, res: Response) => {
       organizationId,
       actionToken,
       onToken,
+      onReset,
     });
 
     logStep("[6/6] Server: Agent response received");

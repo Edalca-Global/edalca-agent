@@ -100,6 +100,29 @@ const callModel = async (
   const start = performance.now();
   console.log("🚀 Agent model streaming started");
 
+  // Gemini regularly emits a COMPLETE answer alongside a tool call, so the graph
+  // loops back through `tools` and this node answers a second time. Every pass
+  // reaches the user through `onToken`, with nothing separating them, so one
+  // bubble ended up holding two answers glued together mid-token
+  // ("…Modules%20(2).pdfA **SIGA-CR** is a…"). That also broke the SOURCES
+  // parser in web-front, which read the second answer as part of the first
+  // answer's S3 URL and produced a link that 403s.
+  //
+  // Text from an earlier pass of THIS turn is superseded by what follows, so
+  // tell the client to drop what it has rather than appending to it. Scoped
+  // after the last human message: earlier turns are history, not this answer.
+  const lastHumanIndex = state.messages
+    .map((m) => m.getType())
+    .lastIndexOf("human");
+  const hasSupersededText = state.messages
+    .slice(lastHumanIndex + 1)
+    .some((m) => m.getType() === "ai" && textOf(m.content).trim().length > 0);
+
+  if (hasSupersededText) {
+    console.log("↩️ Resetting stream: an earlier agent pass already sent text");
+    config?.configurable?.onReset?.();
+  }
+
   const stream = await model.stream(
     // Built per call, not once at import: the prompt carries today's date and
     // this process stays up for days.
@@ -200,6 +223,7 @@ export async function runWorkOrderAgent(
     organizationId,
     actionToken,
     onToken,
+    onReset,
   }: {
     memoryClient: BedrockAgentCoreClient;
     memoryId: string;
@@ -209,6 +233,12 @@ export async function runWorkOrderAgent(
     /** Short-lived credential minted by web-back; the work order tool presents it. */
     actionToken?: string;
     onToken?: (token: string) => void;
+    /**
+     * Fired when a later agent pass supersedes text already streamed for this
+     * turn. The client must DISCARD what it has rather than append — see the
+     * comment in `callModel`.
+     */
+    onReset?: () => void;
   }
 ) {
   const totalStart = performance.now();
@@ -275,16 +305,10 @@ export async function runWorkOrderAgent(
     summaries: summaryContext,
   };
 
-  const stream = await app.stream(initialState, {
-    configurable: { thread_id, onToken: onToken, actionToken },
-    metadata: { onToken },
-    streamMode: "messages",
-  });
-
   let finalContent = "";
   let lastToolCall: any = null;
   /**
-   * Every character the agent node emitted, never reset.
+   * Every character the agent node emitted that has not been superseded.
    *
    * `finalContent` is wiped whenever a chunk carries a tool call, so that
    * "let me look that up…" does not get persisted as the answer. But the user
@@ -292,8 +316,31 @@ export async function runWorkOrderAgent(
    * is produced — and if the run ends on a tool-call chunk the wipe leaves
    * nothing at all. That is how an empty assistant entry reached Bedrock, which
    * rejects the whole event and took the user's own message down with it.
+   *
+   * A reset is the one case where the user has seen text that must NOT be kept:
+   * the client is told to drop it, so persisting it would put an answer in
+   * memory that no longer matches the bubble.
    */
   let streamedText = "";
+
+  // Keep the persistence view in step with the client's. Both buffers hold text
+  // the next pass is about to replace.
+  const handleReset = () => {
+    finalContent = "";
+    streamedText = "";
+    onReset?.();
+  };
+
+  const stream = await app.stream(initialState, {
+    configurable: {
+      thread_id,
+      onToken: onToken,
+      onReset: handleReset,
+      actionToken,
+    },
+    metadata: { onToken },
+    streamMode: "messages",
+  });
 
   // `streamMode: "messages"` yields one tuple per TOKEN CHUNK, not per node —
   // so a node name on a tuple says which node produced that token, nothing more.
