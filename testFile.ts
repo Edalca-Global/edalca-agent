@@ -27,6 +27,7 @@ import { queryKnowledgeBaseTool } from "./tools/queryKnowledgeBaseTool";
 import * as crypto from "crypto";
 import { buildSystemInstruction } from "./constants/prompts";
 import { webSearchGroundingTool } from "./tools/webSearchTool";
+import { MAX_MEMORY_TEXT_BYTES, truncateUtf8 } from "./utils";
 
 // ---------------------------
 // Timing Utility
@@ -451,8 +452,12 @@ export async function runWorkOrderAgent(
     { role: Role.ASSISTANT, text: assistantText },
   ]
     .filter((entry) => typeof entry.text === "string" && entry.text.trim().length > 0)
+    // Oversize entries are rejected the same way — whole event — so cap them.
     .map((entry) => ({
-      conversational: { role: entry.role, content: { text: entry.text } },
+      conversational: {
+        role: entry.role,
+        content: { text: truncateUtf8(entry.text, MAX_MEMORY_TEXT_BYTES) },
+      },
     }));
 
   if (finalContent.trim().length === 0 && assistantText.trim().length > 0) {
