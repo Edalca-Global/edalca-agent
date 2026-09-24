@@ -1,46 +1,36 @@
-import {
-  BedrockAgentCoreControlClient,
-  CreateMemoryCommand,
-} from "@aws-sdk/client-bedrock-agentcore-control";
-import AgentMemory from "../model/agent/agentModel";
+/**
+ * Lynk has ONE AgentCore memory for the whole platform (per environment),
+ * configured as AGENTCORE_MEMORY_ID. Tenants are separated only by actorId, which
+ * also becomes the summary namespace `/summaries/{actorId}/{sessionId}` — so the
+ * org prefix gives every tenant its own namespace prefix for audit and deletion.
+ *
+ * Both parts are restricted to [A-Za-z0-9-]: `_` is the separator and `/` would
+ * let a crafted id escape its namespace segment. In practice both are ObjectIds.
+ */
+const ACTOR_ID_PART = /^[A-Za-z0-9-]+$/;
 
-export function sanitizeMemoryName(chatId: string): string {
-  // Replace invalid characters with underscores
-  let base = chatId.replace(/[^a-zA-Z0-9_]/g, "_");
-
-  // Ensure it starts with a letter
-  if (!/^[a-zA-Z]/.test(base)) {
-    base = `m_${base}`;
+export function buildActorId(organizationId: unknown, userId: unknown): string {
+  if (
+    typeof organizationId !== "string" || !ACTOR_ID_PART.test(organizationId) ||
+    typeof userId !== "string" || !ACTOR_ID_PART.test(userId)
+  ) {
+    throw new Error("Invalid organizationId or userId for memory actorId");
   }
-
-  // Truncate to max 48 characters
-  return base.slice(0, 48);
+  return `${organizationId}_${userId}`;
 }
 
-export async function getOrCreateMemory(client: any, chatId: string) {
-  // Check if memory already exists for this user
-  let memory = await AgentMemory.findOne({ chatId: chatId });
+/**
+ * CreateEvent rejects any single message over 100 KB, and it rejects the WHOLE
+ * event — the same failure mode as an empty entry. Cut long text to a byte budget
+ * below that limit instead of losing the turn.
+ */
+export const MAX_MEMORY_TEXT_BYTES = 90 * 1024;
 
-  if (!memory) {
-    // Create a new memory in Bedrock
-    const memoryName = sanitizeMemoryName(chatId);
-
-    const params = {
-      name: memoryName,
-      description: `Persistent memory for user ${chatId}`,
-      eventExpiryDuration: 100,
-    };
-
-    const result: any = await client.send(new CreateMemoryCommand(params));
-    const newMemoryId = result?.memory?.id; // depends on AWS SDK response shape
-    // Save in MongoDB
-    memory = await AgentMemory.create({
-      chatId: chatId,
-      memoryId: newMemoryId,
-    });
-  }
-
-  return memory.memoryId;
+export function truncateUtf8(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= maxBytes) return text;
+  // A cut through a multi-byte character decodes to U+FFFD; drop it.
+  return buf.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD+$/, "");
 }
 
 import { BaseMessage } from "@langchain/core/messages";
