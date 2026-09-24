@@ -57,6 +57,52 @@ app.post("/invocations", async (req: Request, res: Response) => {
         .json({ error: "Missing or invalid 'prompt' in request payload." });
     }
 
+    // ===== TEMP: MAINTENANCE MODE — remove this whole block to restore Lynk =====
+    // Short-circuits every query while dev/QA work is in progress.
+    // Streamed as `token` frames so web-back (ChatBotService) renders it as a
+    // normal assistant message with no client-side change.
+    {
+      const MAINTENANCE_MESSAGE =
+        "Hi! I'm Lynk. I'm temporarily offline for scheduled maintenance and " +
+        "upgrades, so I can't answer questions right now. Please check back " +
+        "soon — I'll be right back with new improvements. Thanks for your patience!";
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("X-Accel-Buffering", "no");
+
+      const send = (payload: object) =>
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+      // Chunk by word so the UI still gets its progressive-typing effect.
+      for (const word of MAINTENANCE_MESSAGE.split(" ")) {
+        send({
+          type: "token",
+          content: `${word} `,
+          timestamp: new Date().toISOString(),
+        });
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      send({
+        type: "metadata",
+        sources: null,
+        metadata: {
+          responseTime: Date.now() - startTime,
+          sessionId,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      send({ type: "done", timestamp: new Date().toISOString() });
+
+      console.log("🚧 Maintenance mode: returned under-construction notice");
+      res.end();
+      return;
+    }
+    // ===== END TEMP: MAINTENANCE MODE =====
+
     logStep("[3/6] Server: Request validated");
     // ----- SESSION INTEGRATION -----
     // const session = await GenerateTitleForSession(client, chatId, sessionId, userQuery);
