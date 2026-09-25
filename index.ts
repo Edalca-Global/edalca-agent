@@ -18,7 +18,7 @@ import { ListEventsCommand } from "@aws-sdk/client-bedrock-agentcore";
 import { cleanPastMessagesAfterReset, extractSourcesFromMessages } from "./utils";
 import { queryKnowledgeBaseTool } from "./tools/queryKnowledgeBaseTool";
 import { SYSTEM_PROMPT } from "./constants/prompts";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { createChatModel } from "./llm";
 
 function convertEventToMessages(event: any): BaseMessage[] {
   console.log('event', event);
@@ -150,11 +150,10 @@ const toolNode = new ToolNode<typeof GraphState.State>(tools);
 // ---------------------------
 // 1. Initialize the model
 // Use the official LangChain class - it handles Zod schemas automatically
-const model = new ChatGoogleGenerativeAI({
+const model = createChatModel({
   model: 'gemini-3-flash-preview', // or "gemini-1.5-flash"
-  apiKey: process.env.GEMINI_API_KEY,
   temperature: 0,
-}).bindTools(tools); 
+}).bindTools!(tools);
 
 // 2. Updated callModel node
 async function callModel(state: typeof GraphState.State) {
@@ -456,6 +455,7 @@ export async function callAgent(
     session_id,    // session ID
     organizationId,
     onToken,
+    onReset,
   }: {
     memoryClient: BedrockAgentCoreClient;
     memoryId: string;
@@ -463,6 +463,11 @@ export async function callAgent(
     session_id: string;
     organizationId: string;
     onToken?: (token: string) => void;
+    /**
+     * Fired when a later agent pass supersedes text already streamed for this
+     * turn. The client must DISCARD what it has rather than append.
+     */
+    onReset?: () => void;
   }
 ) {
   const agentStartTime = Date.now();
@@ -532,11 +537,32 @@ const eventStream = app.streamEvents(initialState, {
   configurable: { thread_id, user: { userId: actor_id, organizationId } }
 });
 
+// Mirrors `callModel` in testFile.ts, which is the path server.ts actually runs.
+// Gemini emits text alongside a tool call, so the first agent pass can deliver a
+// complete answer that the post-tool pass then answers again. Streaming both into
+// one buffer put two answers in a single bubble, glued mid-token — which also
+// broke the SOURCES parser in web-front. A second visit to the agent node
+// supersedes whatever it streamed before: tell the client to drop it.
+let streamedText = false;
+let currentNode: string | undefined;
+
 for await (const event of eventStream) {
+  const node: string | undefined = (event as any).metadata?.langgraph_node;
+
+  if (node && node !== currentNode) {
+    if (node === "agent" && streamedText) {
+      console.log("↩️ Resetting stream: an earlier agent pass already sent text");
+      streamedText = false;
+      onReset?.();
+    }
+    currentNode = node;
+  }
+
   // on_chat_model_stream captures tokens from the NEW model automatically
   if (event.event === "on_chat_model_stream") {
     const chunk = event.data.chunk;
     if (chunk.content) {
+      streamedText = true;
       onToken?.(chunk.content);
     }
   }

@@ -5,7 +5,6 @@ export type ChatType = "PRIVATE" | "GROUP" | "LOCATION";
 export interface IChat extends Document {
   chatType: ChatType;
   name: string;
-  memoryId: string, // for AI Agent in agentCore
   sessions: mongoose.Types.ObjectId[];
   members: mongoose.Types.ObjectId[]; // User IDs
   groupId: mongoose.Types.ObjectId;
@@ -23,7 +22,6 @@ const ChatSchema = new mongoose.Schema(
       enum: ["PRIVATE", "GROUP", "LOCATION"],
       required: true,
     },
-    memoryId: { type: String, default: null },
     sessions: [{ type: mongoose.Schema.Types.ObjectId, ref: "ChatSession" }],
     members: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },

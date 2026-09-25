@@ -119,4 +119,6 @@ dist
 
 ./package-lock.json
 
+CLAUDE.md
+
 # End of https://mrkandreev.name/snippets/gitignore-generator/#Node

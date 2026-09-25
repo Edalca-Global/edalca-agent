@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - development
+      - qa-testing
       - production
 
 jobs:
@@ -40,6 +41,10 @@ jobs:
             echo "tag=latest" >> $GITHUB_OUTPUT
             echo "runtime_id=edalca_agent_prod-Fs8i278B72" >> $GITHUB_OUTPUT
             echo "role_arn=arn:aws:iam::724772076413:role/service-role/AmazonBedrockAgentCoreRuntimeDefaultServiceRole-ue9l6" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == "qa-testing" ]]; then
+            echo "tag=qa-latest" >> $GITHUB_OUTPUT
+            echo "runtime_id=edalca_agent_qa-jSfSuH86dJ" >> $GITHUB_OUTPUT
+            echo "role_arn=arn:aws:iam::724772076413:role/service-role/AmazonBedrockAgentCoreRuntimeDefaultServiceRole-h9iqv" >> $GITHUB_OUTPUT
           else
             echo "tag=dev-latest" >> $GITHUB_OUTPUT
             echo "runtime_id=edalca_agent-Zw5Q4q6PFw" >> $GITHUB_OUTPUT
@@ -57,6 +62,7 @@ jobs:
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com/edalca-agent:${{ github.sha }}
 
       - name: Update Bedrock AgentCore Runtime
+        if: steps.vars.outputs.runtime_id != '' && steps.vars.outputs.role_arn != ''
         run: |
           aws bedrock-agentcore-control update-agent-runtime \
             --agent-runtime-id "${{ steps.vars.outputs.runtime_id }}" \
@@ -68,11 +74,13 @@ jobs:
                 "maxLifetime": 28800
             }' \
             --environment-variables '{
+                "AGENTCORE_MEMORY_ID": "${{ secrets.AGENTCORE_MEMORY_ID }}",
                 "AWS_ACCESS_KEY_ID": "${{ secrets.AWS_ACCESS_KEY_ID }}",
                 "AWS_REGION":  "${{ secrets.AWS_REGION }}",
                 "AWS_SECRET_ACCESS_KEY": "${{ secrets.AWS_SECRET_ACCESS_KEY }}",
                 "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}",
                 "GENERAL_KB_ID": "${{ secrets.GENERAL_KB_ID }}",
                 "KB_ID": "${{ secrets.KB_ID }}",
-                "MONGO_URI": "${{ secrets.MONGO_URI }}"
+                "MONGO_URI": "${{ secrets.MONGO_URI }}",
+                "WEB_BACK_URL": "${{ secrets.WEB_BACK_URL }}"
             }'

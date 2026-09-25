@@ -1,12 +1,12 @@
+import "dotenv/config";
 import express, { Request, Response } from "express";
 import { callAgent } from "./index";
-import dotenv from "dotenv";
 import cors from "cors";
 import { BedrockAgentCoreControlClient } from "@aws-sdk/client-bedrock-agentcore-control";
 import { BedrockAgentCoreClient } from "@aws-sdk/client-bedrock-agentcore";
 import { runWorkOrderAgent } from "./testFile";
+import { buildActorId } from "./utils";
 
-dotenv.config();
 const app = express();
 const port = process.env.PORT || 8080;
 // Middleware
@@ -21,6 +21,14 @@ const client = new BedrockAgentCoreControlClient({
   },
 });
 
+// One AgentCore memory per environment, shared by every tenant. It is config,
+// never request data: a caller-chosen memoryId could point Lynk at any memory
+// this runtime's credentials can reach.
+const MEMORY_ID = process.env.AGENTCORE_MEMORY_ID;
+if (!MEMORY_ID) {
+  console.error("❌ AGENTCORE_MEMORY_ID is not set — every invocation will be rejected");
+}
+
 const memoryClient = new BedrockAgentCoreClient({
   region: process.env.AWS_REGION,
   credentials: {
@@ -30,6 +38,27 @@ const memoryClient = new BedrockAgentCoreClient({
 });
 
 // Handle invocation requests from the Bedrock AgentCore Runtime with streaming
+/**
+ * `actionToken` is a live bearer credential for the Action Layer, and this body
+ * was being logged verbatim on every invocation — into CloudWatch, whose read
+ * audience is far wider than the API the token guards. The length is kept
+ * because it is the only diagnostic the log ever carried: it separates "no token
+ * was sent" from "a token was sent and rejected".
+ */
+const redactBody = (body: unknown): unknown => {
+  if (!body || typeof body !== "object") return body;
+  const { actionToken, ...rest } = body as Record<string, unknown>;
+  return {
+    ...rest,
+    actionToken:
+      typeof actionToken === "string"
+        ? `[redacted len=${actionToken.length}]`
+        : actionToken === undefined
+        ? "[absent]"
+        : "[redacted]",
+  };
+};
+
 app.post("/invocations", async (req: Request, res: Response) => {
   const startTime = Date.now();
   console.log('Agent Invoked ', startTime);
@@ -47,14 +76,36 @@ app.post("/invocations", async (req: Request, res: Response) => {
     logStep("[1/6] Server: Request received");
     // await initializeMongoConnection();
     // logStep("[2/6] Server: MongoDB connection initialized");
-    console.log("-Request Body", req.body);
+    console.log("-Request Body", redactBody(req.body));
 
-    const { prompt: userQuery, chatId, memoryId, sessionId, userId, organizationId } = req.body;
+    // `chatId` is intentionally not forwarded to the agent: web-back binds it
+    // into the action token at mint time, so the work order draft is scoped to
+    // this conversation without the model ever handling an identifier.
+    const { prompt: userQuery, chatId, sessionId, userId, organizationId, actionToken } = req.body;
 
     if (!userQuery || typeof userQuery !== "string") {
       return res
         .status(400)
         .json({ error: "Missing or invalid 'prompt' in request payload." });
+    }
+
+    if (!MEMORY_ID) {
+      return res.status(500).json({ error: "Agent memory is not configured." });
+    }
+
+    let actorId: string;
+    try {
+      actorId = buildActorId(organizationId, userId);
+    } catch {
+      return res
+        .status(400)
+        .json({ error: "Missing or invalid 'userId'/'organizationId' in request payload." });
+    }
+
+    if (!sessionId || typeof sessionId !== "string") {
+      return res
+        .status(400)
+        .json({ error: "Missing or invalid 'sessionId' in request payload." });
     }
 
     logStep("[3/6] Server: Request validated");
@@ -93,6 +144,16 @@ app.post("/invocations", async (req: Request, res: Response) => {
       })}\n\n`);
     };
 
+    // A later agent pass supersedes everything streamed so far this turn.
+    // Consumers must DISCARD, not append — see `callModel` in testFile.ts.
+    const onReset = () => {
+      accumulatedTokens = "";
+      res.write(`data: ${JSON.stringify({
+        type: 'reset',
+        timestamp: new Date().toISOString(),
+      })}\n\n`);
+    };
+
     // const agentResponse = await callAgent(userQuery, `thread-${Date.now()}`, {
     //   memoryClient,
     //   memoryId,
@@ -100,15 +161,18 @@ app.post("/invocations", async (req: Request, res: Response) => {
     //   session_id: sessionId,
     //   organizationId,
     //   onToken,
+    //   onReset,
     // });
 
     const agentResponse = await runWorkOrderAgent(userQuery, `thread-${Date.now()}`, {
       memoryClient,
-      memoryId,
-      actor_id: userId,
+      memoryId: MEMORY_ID,
+      actor_id: actorId,
       session_id: sessionId,
       organizationId,
+      actionToken,
       onToken,
+      onReset,
     });
 
     logStep("[6/6] Server: Agent response received");

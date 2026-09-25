@@ -3,7 +3,7 @@
     "version": "1.0.0",
     "description": "A LangGraph agent with custom tools.",
     "scripts": {
-        "start": "ts-node-dev --respawn --transpile-only local_runner.ts",
+        "start": "ts-node-dev --respawn --transpile-only server.ts",
         "build": "tsc",
         "serve": "node dist/server.js"
     },
@@ -18,6 +18,7 @@
         "@langchain/core": "^1.1.28",
         "@langchain/google-genai": "^2.1.20",
         "@langchain/langgraph": "^1.1.5",
+        "@langchain/ollama": "1.2.0",
         "cors": "^2.8.5",
         "dotenv": "^17.2.1",
         "express": "^4.19.2",
