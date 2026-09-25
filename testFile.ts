@@ -13,6 +13,7 @@ import {
   AIMessage,
   HumanMessage,
   SystemMessage,
+  AIMessageChunk,
 } from "@langchain/core/messages";
 import {
   ListEventsCommand,
@@ -40,6 +41,9 @@ const logStep = (label: string, start: number) => {
 
 /** Per-token chunk logging. Noisy by design — off unless explicitly asked for. */
 const DEBUG_TOKENS = process.env.DEBUG_AGENT_TOKENS === "1";
+
+/** Per tool result, in the history kept for later turns. */
+const TOOL_RESULT_MEMORY_CHARS = 2000;
 
 /**
  * Gemini and Ollama both stream `content` as a string OR as an array of parts,
@@ -278,7 +282,16 @@ export async function runWorkOrderAgent(
   // ---------------------------
   const processStart = performance.now();
 
-  const historyMessages: BaseMessage[] = (historyResponse.events || []).flatMap(
+  // ListEvents returns the NEWEST event first. Fed in that order, the model read
+  // the conversation backwards: a "yes" landed after whichever question was
+  // oldest, so it confirmed an assignee instead of the discard it had just
+  // asked about, and a confirmed discard was asked for again forever.
+  const orderedEvents = [...(historyResponse.events || [])].sort(
+    (a: any, b: any) =>
+      new Date(a.eventTimestamp).getTime() - new Date(b.eventTimestamp).getTime()
+  );
+
+  const historyMessages: BaseMessage[] = orderedEvents.flatMap(
     (event: any) => {
       return (event.payload || []).map((p: any) => {
         const content = p.conversational?.content?.text || "";
@@ -323,6 +336,14 @@ export async function runWorkOrderAgent(
    * memory that no longer matches the bubble.
    */
   let streamedText = "";
+
+  /**
+   * What each tool returned this turn, keyed by tool call so a message the stream
+   * emits twice is kept once. Persisted so the next turn can see it: a tool that
+   * answers "ask the user, then call again with confirmDiscard: true" is useless
+   * if all the model later remembers is that the tool was called.
+   */
+  const toolResults = new Map<string, { name: string; text: string }>();
 
   // Keep the persistence view in step with the client's. Both buffers hold text
   // the next pass is about to replace.
@@ -376,9 +397,14 @@ export async function runWorkOrderAgent(
     nodeTokens += 1;
 
     if (node === "agent") {
-      const delta = textOf(message.content);
-      finalContent += delta;
-      streamedText += delta;
+      // Tokens arrive as AIMessageChunks. When the node finishes, LangGraph also
+      // emits the AIMessage it returned — whole, because it has no id to dedupe
+      // on — so counting that too stored every answer twice, back to back.
+      if (AIMessageChunk.isInstance(message)) {
+        const delta = textOf(message.content);
+        finalContent += delta;
+        streamedText += delta;
+      }
 
       if ((message as AIMessage).tool_calls?.length) {
         lastToolCall = (message as AIMessage).tool_calls;
@@ -399,6 +425,8 @@ export async function runWorkOrderAgent(
       console.log(
         `🧰 Tool result: ${(message as any).name} → ${result.slice(0, 600)}${result.length > 600 ? " …[truncated]" : ""}`
       );
+      const key = (message as any).tool_call_id ?? `${(message as any).name}:${result}`;
+      toolResults.set(key, { name: (message as any).name, text: result });
     }
   }
   closeNode();
@@ -439,16 +467,23 @@ export async function runWorkOrderAgent(
   // Prefer the post-tool answer; fall back to everything the user was shown.
   const assistantText = finalContent.trim().length > 0 ? finalContent : streamedText;
 
+  // Results are capped so one large search result does not crowd out the
+  // conversation in the 10 events read back next turn.
+  const toolText =
+    toolResults.size > 0
+      ? [...toolResults.values()]
+          .map(
+            ({ name, text }) =>
+              `Used Tool: ${name}\nResult:\n${text.length > TOOL_RESULT_MEMORY_CHARS ? `${text.slice(0, TOOL_RESULT_MEMORY_CHARS)} …[truncated]` : text}`
+          )
+          .join("\n\n")
+      : lastToolCall
+        ? `Used Tools: ${lastToolCall.map((t: any) => t.name).join(", ")}`
+        : "";
+
   const memoryPayload = [
     { role: Role.USER, text: userQuery },
-    ...(lastToolCall
-      ? [
-          {
-            role: Role.TOOL,
-            text: `Used Tools: ${lastToolCall.map((t: any) => t.name).join(", ")}`,
-          },
-        ]
-      : []),
+    ...(toolText ? [{ role: Role.TOOL, text: toolText }] : []),
     { role: Role.ASSISTANT, text: assistantText },
   ]
     .filter((entry) => typeof entry.text === "string" && entry.text.trim().length > 0)
